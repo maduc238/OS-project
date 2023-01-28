@@ -13,14 +13,13 @@ from torch.utils.data import DataLoader
 
 import os
 import argparse
-import threading
+# import threading
 
 BATCH_SIZE = 60
-EPOCHS = 10
+EPOCHS = 5
 LEARNING_RATE = 0.1
 MOMENTUM = 0.5
 LOG_INTERVAL = 10
-
 
 
 class Network1(nn.Module):
@@ -84,8 +83,8 @@ class Network2(nn.Module):
 
 
 def run_master():
-    train_data = datasets.MNIST(root='data',train=True,download=True,transform=transforms.ToTensor())
-    test_data = datasets.MNIST(root='data',train=False,download=True,transform=transforms.ToTensor())
+    train_data = datasets.MNIST(root='../data',train=True,download=True,transform=transforms.ToTensor())
+    test_data = datasets.MNIST(root='../data',train=False,download=True,transform=transforms.ToTensor())
 
     # decrease train and test size
     train_data = Subset(train_data, indices=range(len(train_data) // 10))

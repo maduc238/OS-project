@@ -10,10 +10,11 @@ import torch.distributed.autograd as dist_autograd
 from torch.distributed.rpc import RRef
 from torch.distributed.optim import DistributedOptimizer
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import os
 import argparse
-# import threading
+import threading
 
 BATCH_SIZE = 60
 EPOCHS = 5
@@ -23,63 +24,77 @@ LOG_INTERVAL = 10
 
 
 class Network1(nn.Module):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         super(Network1, self).__init__()
         self.conv1 = nn.Conv2d(1,10,kernel_size=5)
         self.conv2 = nn.Conv2d(10,20,kernel_size=5)
         self.conv2_drop = nn.Dropout2d()
-        # remote control to network2
-        self.rref1 = rpc.remote(
-            'worker1',
-            Network2,
-            timeout = 0
-        )
 
-    def forward(self, x):
-        # Server 1:
-        # Convolutional Layer/Pooling Layer/Activation
+    def forward(self, x_rref):
+        x = x_rref.to_here()
         z1 = F.relu(F.max_pool2d(self.conv1(x), 2))
-        # Convolutional Layer/Dropout/Pooling Layer/Activation
         z2 = self.conv2(z1)
-        z3 = F.relu(F.max_pool2d(self.conv2_drop(z2), 2))
-        z3 = z3.view(-1, 320)
-        x_rref = RRef(z3)
-        # recive output data from server2
-        out_futures = self.rref1.rpc_sync().forward(x_rref)
-        return out_futures
+        return self.conv2_drop(z2)
     
     def parameter_rrefs(self):
-        remote_params = []
-        # server1 parameters
-        remote_params.extend([RRef(p) for p in self.parameters()])
-        # server2 parameters
-        remote_params.extend(self.rref1.remote().parameter_rrefs().to_here())
-        return remote_params
+        return [RRef(p) for p in self.parameters()]
 
 class Network2(nn.Module):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         super(Network2, self).__init__()
         self.fc1 = nn.Linear(320,50)
         self.fc2 = nn.Linear(50,10)
 
-        self._lock = threading.Lock()
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-    def forward(self, z3):
-        # recive data from server1
-        x = z3.to_here().to(self.device)
-        with self._lock:
-            # Server 2:
-            # Fully Connected Layer/Activation
-            z4 = F.dropout(F.relu(self.fc1(x)))
-            # Fully Connected Layer/Activation
-            z5 = self.fc2(z4)
-            # Softmax gets probabilities
-            output = F.log_softmax(z5, dim=1)
-        return output.cpu()
+    def forward(self, x_rref):
+        x = x_rref.to_here()
+        z3 = F.relu(F.max_pool2d(x, 2))
+        z3 = z3.view(-1, 320)
+        z4 = F.dropout(F.relu(self.fc1(z3)))
+        z5 = self.fc2(z4)
+        output = F.log_softmax(z5, dim=1)
+        return output
 
     def parameter_rrefs(self):
         return [RRef(p) for p in self.parameters()]
+
+class DistNet(nn.Module):
+    """
+    Assemble two parts as an nn.Module and define pipelining logic
+    """
+    def __init__(self, split, workers, *args, **kwargs):
+        super(DistNet, self).__init__()
+        self.split = split
+        self.p1_rref = rpc.remote(
+            workers[0],
+            Network1,
+            args = args,
+            kwargs = kwargs,
+            timeout = 0
+        )
+        self.p2_rref = rpc.remote(
+            workers[1],
+            Network2,
+            args = args,
+            kwargs = kwargs,
+            timeout = 0
+        )
+
+    def forward(self, xs):
+        out_futures = []
+        for x in iter(xs.chunk(self.split, dim=0)):
+            x1_rref = RRef(x)
+            x2_rref = self.p1_rref.remote().forward(x1_rref)
+            x3_fut = self.p2_rref.rpc_async().forward(x2_rref)
+            out_futures.append(x3_fut)
+
+        # collect and cat all output tensors into one tensor.
+        return torch.cat(torch.futures.wait_all(out_futures))
+
+    def parameter_rrefs(self):
+        remote_params = []
+        remote_params.extend(self.p1_rref.remote().parameter_rrefs().to_here())
+        remote_params.extend(self.p2_rref.remote().parameter_rrefs().to_here())
+        return remote_params
 
 
 def run_master():
@@ -87,14 +102,13 @@ def run_master():
     test_data = datasets.MNIST(root='../data',train=False,download=True,transform=transforms.ToTensor())
 
     # decrease train and test size
-    train_data = Subset(train_data, indices=range(len(train_data) // 10))
-    test_data = Subset(test_data, indices=range(len(test_data) // 10))
+    # train_data = Subset(train_data, indices=range(len(train_data) // 10))
+    # test_data = Subset(test_data, indices=range(len(test_data) // 10))
 
-    train_loader = DataLoader(train_data,batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_data,batch_size=BATCH_SIZE)
+    train_loader = DataLoader(train_data,batch_size=BATCH_SIZE*args.split)
+    test_loader = DataLoader(test_data,batch_size=BATCH_SIZE*args.split)
 
-    model = Network1()
-    model.cpu()
+    model = DistNet(args.split, ["worker0", "worker1"])
 
     dist_optim = DistributedOptimizer(
         optimizer_class=optim.SGD,
@@ -104,16 +118,17 @@ def run_master():
     
     def train(epoch):
         model.train()
-        for batch_idx, (data, target) in enumerate(train_loader):
+        # for batch_idx, (data, target) in enumerate(train_loader):
+        for (data, target) in tqdm(train_loader):
             with dist_autograd.context() as context_id:
                 output = model(data)
                 loss = [F.nll_loss(output, target)]
                 dist_autograd.backward(context_id, loss)
                 dist_optim.step(context_id)
-            if batch_idx % LOG_INTERVAL == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader), loss[0]))
+            # if batch_idx % LOG_INTERVAL == 0:
+            #     print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            #         epoch, batch_idx * len(data), len(train_loader.dataset),
+            #         100. * batch_idx / len(train_loader), loss[0]))
 
     def test():
         model.eval()
@@ -130,6 +145,7 @@ def run_master():
             test_loss, correct, len(test_loader.dataset),
             100.0 * correct / len(test_loader.dataset)))
 
+    print("Split =",args.split)
     for epoch in range(1, EPOCHS + 1):
         train(epoch)
         test()
@@ -153,21 +169,25 @@ if __name__=="__main__":
     parser.add_argument('--master_port', type=str, default="29500", metavar='MP',
         help="""Port that master is listening on, will default to 29500 if not
         provided. Master must be able to accept network traffic on the host and port.""")
-
+    parser.add_argument(
+        "--split",
+        type=int,
+        default=1,
+        help="""Number of splitting batch""")
 
     args = parser.parse_args()
     assert args.rank is not None, "Must provide rank argument."
 
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    # os.environ['GLOO_SOCKET_IFNAME'] = args.interface
-    # os.environ["TP_SOCKET_IFNAME"] = args.interface
+    os.environ['GLOO_SOCKET_IFNAME'] = args.interface
+    os.environ["TP_SOCKET_IFNAME"] = args.interface
 
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=0)
 
     if args.rank == 0:
         rpc.init_rpc(
-            name="master",
+            name=f"worker{args.rank}",
             rank=args.rank,
             world_size=args.world_size,
             rpc_backend_options=options

@@ -105,8 +105,8 @@ def run_master():
     # train_data = Subset(train_data, indices=range(len(train_data) // 10))
     # test_data = Subset(test_data, indices=range(len(test_data) // 10))
 
-    train_loader = DataLoader(train_data,batch_size=BATCH_SIZE*args.split)
-    test_loader = DataLoader(test_data,batch_size=BATCH_SIZE*args.split)
+    train_loader = DataLoader(train_data,batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_data,batch_size=BATCH_SIZE)
 
     model = DistNet(args.split, ["worker0", "worker1"])
 
@@ -181,9 +181,9 @@ if __name__=="__main__":
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
     os.environ['GLOO_SOCKET_IFNAME'] = args.interface
-    os.environ["TP_SOCKET_IFNAME"] = args.interface
+    # os.environ["TP_SOCKET_IFNAME"] = args.interface
 
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=0)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=8, rpc_timeout=0)
 
     if args.rank == 0:
         rpc.init_rpc(
